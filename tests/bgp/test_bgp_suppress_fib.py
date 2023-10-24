@@ -47,6 +47,13 @@ SRC_IP = {
 USER_DEFINED_VRF = "Vrf1"
 DEFAULT = "default"
 VRF_TYPES = [DEFAULT, USER_DEFINED_VRF]
+DEFAULT_TEST_TYPE = "function"
+TEST_TYPES = [DEFAULT_TEST_TYPE, "stress"]
+IP_ROUTE = '91.0.1.0/24'
+IPV6_ROUTE = '1000:1001::/64'
+ROUTE_COUNT = 2
+BULK_ROUTE_COUNT = 1000
+REPEAT_TIMES = 10
 
 STATIC_ROUTE_PREFIX = "1.1.1.0/24"
 # ipv4 route injection from T0
@@ -204,25 +211,35 @@ def setup_vrf(duthost, nbrhosts, tbinfo):
     setup_vrf_cfg(duthost, cfg_t1, nbrhosts, tbinfo)
 
 
-def install_route_from_exabgp(operation, ptfip, route, port):
+def install_route_from_exabgp(operation, ptfip, routes, exabgp_port_ipv4, exabgp_port_ipv6):
     """
     Install or withdraw ipv4 or ipv6 route by exabgp
     """
-    url = "http://{}:{}".format(ptfip, port)
-    data = {"command": "{} route {} next-hop self".format(operation, route)}
-    logging.info("url: {}".format(url))
-    logging.info("data: {}".format(data))
-    r = requests.post(url, data=data)
-    assert r.status_code == 200
+    for route in routes:
+        if ':' in route:
+            port = exabgp_port_ipv6
+        else:
+            port = exabgp_port_ipv4
+
+        url = "http://{}:{}".format(ptfip, port)
+        exabgp_cmd = generate_bgp_route_commands(operation, [route])
+        data = {"command": exabgp_cmd}
+        logging.info("url: {}".format(url))
+        logging.info("data: {}".format(data))
+        r = requests.post(url, data=data)
+        assert r.status_code == 200
 
 
-def announce_route(ptfip, route, port, action=ANNOUNCE):
+def announce_route(ptfip, route, exabgp_port, exabgp_port_v6, action=ANNOUNCE):
     """
     Announce or withdraw ipv4 or ipv6 route
     """
     logging.info("\n========================== announce_route -- {} ==========================".format(action))
-    logging.info(" action:{}\n ptfip:{}\n route:{}\n port:{}".format(action, ptfip, route, port))
-    install_route_from_exabgp(action, ptfip, route, port)
+    if ':' in route:
+        logging.info(" action:{}\n ptfip:{}\n route:{}\n port:{}".format(action, ptfip, route, exabgp_port))
+    else:
+        logging.info(" action:{}\n ptfip:{}\n route:{}\n port:{}".format(action, ptfip, route, exabgp_port_v6))
+    install_route_from_exabgp(action, ptfip, route, exabgp_port, exabgp_port_v6)
     logging.info("\n--------------------------------------------------------------------------------")
 
 
@@ -302,10 +319,206 @@ def announce_ipv4_ipv6_routes(ptf_ip, exabgp_port, exabgp_port_v6, action=ANNOUN
     Announce or withdraw ipv4 and ipv6 routes by exabgp
     """
     for route in IP_ROUTE_LIST:
-        announce_route(ptf_ip, route, exabgp_port, action)
+        announce_route(ptf_ip, route, exabgp_port, exabgp_port_v6, action)
 
     for route in IPV6_ROUTE_LIST:
-        announce_route(ptf_ip, route, exabgp_port_v6, action)
+        announce_route(ptf_ip, route, exabgp_port, exabgp_port_v6, action)
+
+
+def ip_increment(ip_str):
+    """
+    Increment an IP subnet by 1.
+
+    Example1:
+        Input: 10.0.1.0/24
+        Output: 10.0.2.0/24
+
+    Example2:
+        Input: 10.0.255.0/24
+        Output: 10.1.0.0/24
+
+    Example3:
+        Input: 1000:1001:0:1::/64
+        Output: 1000:1001:0:2::/64
+    """
+    # Convert the input string into an IP network object
+    net = ipaddress.ip_network(ip_str, strict=False)
+
+    # Calculate the next network address
+    # Input: 10.0.1.0/24
+    # "net.network_address" is the starting address of the current IP subnet, in this example is "10.0.1.0"
+    # "net.num_addresses" is the number of ip addresses in the subnet, in this example is 256
+    # So "10.0.2.0" is the next subnet
+    next_net_addr = net.network_address + net.num_addresses
+
+    # Convert the incremented address back to a string with the same netmask
+    return f"{next_net_addr}/{net.prefixlen}"
+
+
+def generate_ip_routes(start_ip, count=1):
+    """
+    Generate a list of IP routes
+    Example:
+        input: start_ip = '10.0.1.0/24', count=5
+        output: ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24', '10.0.4.0/24', '10.0.5.0/24']
+    """
+    route_list = [start_ip]
+    for _ in range(count - 1):
+        start_ip = ip_increment(start_ip)
+        route_list.append(start_ip)
+    return route_list
+
+
+def generate_bgp_route_commands(action, ip_routes):
+    """
+    Generate an exabgp command to announce or withdraw bgp routes using a given list of IP routes.
+
+    Args:
+    - action (str): Either "announce" or "withdraw"
+    - ip_routes (list): A list of IP routes
+
+    Returns:
+    - string: A command string
+    """
+    if action not in ["announce", "withdraw"]:
+        raise ValueError("Invalid action. Must be 'announce' or 'withdraw'.")
+
+    # From https://github.com/Exa-Networks/exabgp/issues/1187, we can use
+    # command 'announce attribute next-hop self nlri 10.0.0.1/24 10.0.0.2/24'
+    # to announce multiple bgp routes with same attributes in one command
+    command = f"{action} attribute next-hop self nlri {' '.join(ip_routes)}"
+    logging.info("The exabgp command is: {}".format(command))
+
+    return command
+
+
+def get_first_ip(subnet):
+    """
+    Get the first usable IP from the subnet
+    """
+    # Use the subnet to generate an IP network object
+    network = ipaddress.ip_network(subnet, strict=False)
+
+    # hosts() method returns a generator that include all usable IPs in the subnet
+    all_usable_ips = network.hosts()
+
+    # Get the first usable IP from the generator
+    first_ip = next(all_usable_ips)
+
+    return str(first_ip)
+
+
+def generate_traffic_data(route_list, action):
+    """
+    Generate traffic data list
+
+    Example:
+    Input: route_list=['91.0.1.0/24', '91.0.2.0/24'], action='FORWARD'
+    Output: [
+                ('91.0.1.1', 'FORWARD'),
+                ('91.0.2.1', 'FORWARD')
+            ]
+    """
+    traffic_data_list = []
+
+    for route in route_list:
+        first_ip = get_first_ip(route)
+        traffic_data = (first_ip, action)
+        traffic_data_list.append(traffic_data)
+
+    return traffic_data_list
+
+
+@pytest.fixture(scope="module")
+def generate_route_and_traffic_data():
+    """
+    Pytest fixture for generating route and traffic data
+
+    1. Generate routes for ExaBGP to send to DUT
+    2. Generate the destination IP addresses based on the generated routes, which is used to test traffic
+
+    Example:
+    route_and_traffic_data = {
+            'ip_routes_ipv4': ['91.0.1.0/24', '91.0.2.0/24'],
+            'ip_routes_ipv6': ['1000:1001:0:1::/64', '1000:1001:0:2::/64'],
+            'traffic_data_ipv4_drop': [('91.0.1.0/24', 'DROP'), ('91.0.2.0/24', 'DROP')],
+            'traffic_data_ipv6_drop': [('1000:1001:0:1::/64', 'DROP'), ('1000:1001:0:2::/64', 'DROP')],
+            'traffic_data_ipv4_forward': [('91.0.1.0/24', 'FORWARD'), ('91.0.2.0/24', 'FORWARD')],
+            'traffic_data_ipv6_forward': [('1000:1001:0:1::/64', 'FORWARD'), ('1000:1001:0:2::/64', 'FORWARD')]
+        }
+    """
+
+    # Generate test route dynamically for function tests
+    ip_routes_ipv4 = generate_ip_routes(IP_ROUTE, count=ROUTE_COUNT)
+    ip_routes_ipv6 = generate_ip_routes(IPV6_ROUTE, count=ROUTE_COUNT)
+
+    # Generate test route dynamically for stress tests
+    ip_routes_ipv4_stress = generate_ip_routes(IP_ROUTE, count=BULK_ROUTE_COUNT)
+    ip_routes_ipv6_stress = generate_ip_routes(IPV6_ROUTE, count=BULK_ROUTE_COUNT)
+
+    route_and_traffic_data = {
+        "function": {
+            "ip_routes_ipv4": ip_routes_ipv4,
+            "ip_routes_ipv6": ip_routes_ipv6,
+            "traffic_data_ipv4_drop": generate_traffic_data(ip_routes_ipv4, DROP),
+            "traffic_data_ipv6_drop": generate_traffic_data(ip_routes_ipv6, DROP),
+            "traffic_data_ipv4_forward": generate_traffic_data(ip_routes_ipv4, FORWARD),
+            "traffic_data_ipv6_forward": generate_traffic_data(ip_routes_ipv6, FORWARD)
+        },
+        "stress": {
+            "ip_routes_ipv4": ip_routes_ipv4_stress,
+            "ip_routes_ipv6": ip_routes_ipv6_stress,
+            "traffic_data_ipv4_drop": generate_traffic_data(ip_routes_ipv4_stress, DROP),
+            "traffic_data_ipv6_drop": generate_traffic_data(ip_routes_ipv6_stress, DROP),
+            "traffic_data_ipv4_forward": generate_traffic_data(ip_routes_ipv4_stress, FORWARD),
+            "traffic_data_ipv6_forward": generate_traffic_data(ip_routes_ipv6_stress, FORWARD)
+        }
+    }
+
+    return route_and_traffic_data
+
+
+def get_test_data(generate_route_and_traffic_data, test_type, include_forward=True, include_drop=True):
+    """
+    Get test data based on the test type.
+
+    Parameters:
+        generate_route_and_traffic_data: A dict containing routes and traffic data.
+        test_type: The type of the test ("function" or "stress").
+        include_forward: Whether to include forward traffic data.
+        include_drop: Whether to include drop traffic data.
+
+    Returns:
+        tuple: A tuple containing selected routes and traffic data.
+
+    Example:
+    1. Retrieving all data:
+        (ip_routes_ipv4, ip_routes_ipv6, traffic_data_ipv4_forward, traffic_data_ipv6_forward,
+         traffic_data_ipv4_drop, traffic_data_ipv6_drop) = get_test_data(generate_route_and_traffic_data, "function")
+
+    2. Retrieving only routes and forward data:
+        (ip_routes_ipv4, ip_routes_ipv6, traffic_data_ipv4_forward, traffic_data_ipv6_forward) =
+            get_test_data(generate_route_and_traffic_data, "function", include_drop=False)
+    """
+
+    test_data = generate_route_and_traffic_data[test_type]
+    ip_routes_ipv4 = test_data["ip_routes_ipv4"]
+    ip_routes_ipv6 = test_data["ip_routes_ipv6"]
+    results = [ip_routes_ipv4, ip_routes_ipv6]
+
+    # Include forward traffic data if requested
+    if include_forward:
+        traffic_data_ipv4_forward = test_data["traffic_data_ipv4_forward"]
+        traffic_data_ipv6_forward = test_data["traffic_data_ipv6_forward"]
+        results.extend([traffic_data_ipv4_forward, traffic_data_ipv6_forward])
+
+    # Include drop traffic data if requested
+    if include_drop:
+        traffic_data_ipv4_drop = test_data["traffic_data_ipv4_drop"]
+        traffic_data_ipv6_drop = test_data["traffic_data_ipv6_drop"]
+        results.extend([traffic_data_ipv4_drop, traffic_data_ipv6_drop])
+
+    return tuple(results)
 
 
 def config_bgp_suppress_fib(duthost, enable=True):
@@ -353,26 +566,34 @@ def param_reboot(request, duthost, localhost):
         do_and_wait_reboot(duthost, localhost, reboot_type)
 
 
-def validate_route_states(duthost, vrf=DEFAULT, check_point=QUEUED, action=ACTION_IN):
+def validate_route_states(duthost, ip_routes, vrf=DEFAULT, check_point=QUEUED, action=ACTION_IN):
     """
     Verify ipv4 and ipv6 routes install status
     """
-    for route in IP_ROUTE_LIST:
-        check_route_install_status(duthost, route, vrf, IP_VER, check_point, action)
-    for route in IPV6_ROUTE_LIST:
-        check_route_install_status(duthost, route, vrf, IPV6_VER, check_point, action)
+    for route in ip_routes:
+        # IPv4 address has a ".", IPv6 address has a ":", use this to determine the IP version
+        ip_ver = IP_VER if "." in route else IPV6_VER
+        check_route_install_status(duthost, route, vrf, ip_ver, check_point, action)
 
 
-def validate_route_propagate(duthost, tbinfo, vrf=DEFAULT, exist=True):
+def validate_route_propagate(duthost, tbinfo, vrf=DEFAULT, exist=True, ipv4_route_list=None, ipv6_route_list=None):
     """
     Verify ipv4 and ipv6 route propagate status
     """
+    if not ipv4_route_list and not ipv6_route_list:
+        logging.error("Both ipv4_route_list and ipv6_route_list are empty")
+        return
+
     t2_vm = get_vm_name(tbinfo)
     bgp_neighbor_v4, bgp_neighbor_v6 = get_bgp_neighbor_ip(duthost, t2_vm, vrf)
-    for route in IP_ROUTE_LIST:
-        validate_route_propagate_status(duthost, route, bgp_neighbor_v4, vrf, exist=exist)
-    for route in IPV6_ROUTE_LIST:
-        validate_route_propagate_status(duthost, route, bgp_neighbor_v6, vrf, ip_ver=IPV6_VER, exist=exist)
+
+    if ipv4_route_list:
+        for route in ipv4_route_list:
+            validate_route_propagate_status(duthost, route, bgp_neighbor_v4, vrf, exist=exist)
+
+    if ipv6_route_list:
+        for route in ipv6_route_list:
+            validate_route_propagate_status(duthost, route, bgp_neighbor_v6, vrf, ip_ver=IPV6_VER, exist=exist)
 
 
 def redistribute_static_route_to_bgp(duthost, redistribute=True):
@@ -402,8 +623,14 @@ def remove_static_route_and_redistribute(duthost):
 
 
 @pytest.mark.parametrize("vrf_type", VRF_TYPES)
+@pytest.mark.parametrize("test_type", TEST_TYPES)
 def test_bgp_route_with_suppress(duthost, tbinfo, nbrhosts, ptfadapter, localhost, restore_bgp_suppress_fib,
-                                 get_exabgp_ptf_ports, vrf_type, request):
+                                 get_exabgp_ptf_ports, vrf_type, request, generate_route_and_traffic_data, test_type):
+    # Get route and traffic data for testing
+    (ip_routes_ipv4, ip_routes_ipv6,
+     traffic_data_ipv4_forward, traffic_data_ipv6_forward,
+     traffic_data_ipv4_drop, traffic_data_ipv6_drop) = get_test_data(generate_route_and_traffic_data, test_type)
+
     try:
         if vrf_type == USER_DEFINED_VRF:
             with allure.step("Configure user defined vrf"):
@@ -432,33 +659,56 @@ def test_bgp_route_with_suppress(duthost, tbinfo, nbrhosts, ptfadapter, localhos
         with allure.step("Suspend orchagent process to simulate a route install delay"):
             operate_orchagent(duthost)
 
+        # Announce and withdraw BGP routes multiple times
+        if test_type == "stress":
+            for _ in range(REPEAT_TIMES):
+                with allure.step("Announce BGP ipv4 and ipv6 routes to DUT from T0 VM by ExaBGP"):
+                    install_route_from_exabgp(ANNOUNCE, ptf_ip, ip_routes_ipv4 + ip_routes_ipv6,
+                                              exabgp_port, exabgp_port_v6)
+
+                with allure.step("Validate announced BGP ipv4 and ipv6 routes are in {} state".format(QUEUED)):
+                    validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, vrf_type)
+
+                with allure.step("Validate BGP ipv4 and ipv6 routes are not announced to T2 VM peer"):
+                    validate_route_propagate(duthost, tbinfo, vrf_type, exist=False, ipv4_route_list=ip_routes_ipv4,
+                                             ipv6_route_list=ip_routes_ipv6)
+
+                with allure.step("Withdraw BGP ipv4 and ipv6 routes to DUT from T0 VM by ExaBGP"):
+                    install_route_from_exabgp(WITHDRAW, ptf_ip, ip_routes_ipv4 + ip_routes_ipv6,
+                                              exabgp_port, exabgp_port_v6)
+
         with allure.step("Announce BGP ipv4 and ipv6 routes to DUT from T0 VM by ExaBGP"):
-            announce_ipv4_ipv6_routes(ptf_ip, exabgp_port, exabgp_port_v6)
+            install_route_from_exabgp(ANNOUNCE, ptf_ip, ip_routes_ipv4 + ip_routes_ipv6, exabgp_port, exabgp_port_v6)
 
         with allure.step("Validate announced BGP ipv4 and ipv6 routes are in {} state".format(QUEUED)):
-            validate_route_states(duthost, vrf_type)
+            validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, vrf_type)
 
         with allure.step("Validate BGP ipv4 and ipv6 routes are not announced to T2 VM peer"):
-            validate_route_propagate(duthost, tbinfo, vrf_type, exist=False)
+            validate_route_propagate(duthost, tbinfo, vrf_type, exist=False, ipv4_route_list=ip_routes_ipv4,
+                                     ipv6_route_list=ip_routes_ipv6)
 
         with allure.step("Validate traffic could not be forwarded to T0 VM"):
             ptf_interfaces = get_t2_ptf_intfs(mg_facts)
-            validate_traffic(ptfadapter, TRAFFIC_DATA_DROP, router_mac, ptf_interfaces, recv_port)
+            validate_traffic(ptfadapter, traffic_data_ipv4_drop + traffic_data_ipv6_drop,
+                             router_mac, ptf_interfaces, recv_port)
 
         with allure.step("Restore orchagent process"):
             operate_orchagent(duthost, action=ACTION_CONTINUE)
 
         with allure.step("Validate announced BGP ipv4 and ipv6 routes are not in {} state".format(QUEUED)):
-            validate_route_states(duthost, vrf_type, check_point=QUEUED, action=ACTION_NOT_IN)
+            validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, vrf_type,
+                                  check_point=QUEUED, action=ACTION_NOT_IN)
 
         with allure.step("Validate announced BGP ipv4 and ipv6 routes are in {} state".format(OFFLOADED)):
-            validate_route_states(duthost, vrf_type, check_point=OFFLOADED)
+            validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, vrf_type, check_point=OFFLOADED)
 
         with allure.step("Validate BGP ipv4 and ipv6 routes are announced to T2 VM peer"):
-            validate_route_propagate(duthost, tbinfo, vrf_type)
+            validate_route_propagate(duthost, tbinfo, vrf_type, ipv4_route_list=ip_routes_ipv4,
+                                     ipv6_route_list=ip_routes_ipv6)
 
         with allure.step("Validate traffic would be forwarded to T0 VM"):
-            validate_traffic(ptfadapter, TRAFFIC_DATA_FORWARD, router_mac, ptf_interfaces, recv_port)
+            validate_traffic(ptfadapter, traffic_data_ipv4_forward + traffic_data_ipv6_forward,
+                             router_mac, ptf_interfaces, recv_port)
 
     finally:
         if vrf_type == USER_DEFINED_VRF:
@@ -467,7 +717,12 @@ def test_bgp_route_with_suppress(duthost, tbinfo, nbrhosts, ptfadapter, localhos
                 config_reload(duthost)
 
 
-def test_bgp_route_without_suppress(duthost, tbinfo, nbrhosts, ptfadapter, get_exabgp_ptf_ports):
+def test_bgp_route_without_suppress(duthost, tbinfo, nbrhosts, ptfadapter, get_exabgp_ptf_ports,
+                                    generate_route_and_traffic_data, test_type=DEFAULT_TEST_TYPE):
+    # Get route and traffic data for testing
+    (ip_routes_ipv4, ip_routes_ipv6,
+     traffic_data_ipv4_forward, traffic_data_ipv6_forward) = get_test_data(generate_route_and_traffic_data, test_type)
+
     with allure.step("Prepare needed parameters"):
         router_mac = duthost.facts["router_mac"]
         mg_facts = duthost.get_extended_minigraph_facts(tbinfo)
@@ -482,27 +737,35 @@ def test_bgp_route_without_suppress(duthost, tbinfo, nbrhosts, ptfadapter, get_e
         operate_orchagent(duthost)
 
     with allure.step("Announce BGP ipv4 and ipv6 routes to DUT from T0 VM by ExaBGP"):
-        announce_ipv4_ipv6_routes(ptf_ip, exabgp_port, exabgp_port_v6)
+        install_route_from_exabgp(ANNOUNCE, ptf_ip, ip_routes_ipv4 + ip_routes_ipv6, exabgp_port, exabgp_port_v6)
 
     with allure.step("Validate announced BGP ipv4 and ipv6 routes are not in {} state".format(QUEUED)):
-        validate_route_states(duthost, check_point=QUEUED, action=ACTION_NOT_IN)
+        validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, check_point=QUEUED, action=ACTION_NOT_IN)
 
     with allure.step("Validate BGP ipv4 and ipv6 routes are announced to T2 VM peer"):
-        validate_route_propagate(duthost, tbinfo)
+        validate_route_propagate(duthost, tbinfo, ipv4_route_list=ip_routes_ipv4, ipv6_route_list=ip_routes_ipv6)
 
     with allure.step("Restore orchagent process"):
         operate_orchagent(duthost, action=ACTION_CONTINUE)
 
     with allure.step("Validate announced BGP ipv4 and ipv6 routes are in {} state".format(OFFLOADED)):
-        validate_route_states(duthost, check_point=OFFLOADED)
+        validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, check_point=OFFLOADED)
 
     with allure.step("Validate traffic would be forwarded to T0 VM"):
         ptf_interfaces = get_t2_ptf_intfs(mg_facts)
-        validate_traffic(ptfadapter, TRAFFIC_DATA_FORWARD, router_mac, ptf_interfaces, recv_port)
+        validate_traffic(ptfadapter, traffic_data_ipv4_forward + traffic_data_ipv6_forward,
+                         router_mac, ptf_interfaces, recv_port)
 
 
 def test_bgp_route_with_suppress_negative_operation(duthost, tbinfo, nbrhosts, ptfadapter, localhost,
-                                                    restore_bgp_suppress_fib, get_exabgp_ptf_ports):
+                                                    restore_bgp_suppress_fib, get_exabgp_ptf_ports,
+                                                    generate_route_and_traffic_data, test_type=DEFAULT_TEST_TYPE):
+    # Get route and traffic data for testing
+    # Get route and traffic data for testing
+    (ip_routes_ipv4, ip_routes_ipv6,
+     traffic_data_ipv4_forward, traffic_data_ipv6_forward,
+     traffic_data_ipv4_drop, traffic_data_ipv6_drop) = get_test_data(generate_route_and_traffic_data, test_type)
+
     try:
         with allure.step("Prepare needed parameters"):
             router_mac = duthost.facts["router_mac"]
@@ -521,7 +784,7 @@ def test_bgp_route_with_suppress_negative_operation(duthost, tbinfo, nbrhosts, p
             operate_orchagent(duthost)
 
         with allure.step("Announce BGP ipv4 and ipv6 routes to DUT from T0 VM by ExaBGP"):
-            announce_ipv4_ipv6_routes(ptf_ip, exabgp_port, exabgp_port_v6)
+            install_route_from_exabgp(ANNOUNCE, ptf_ip, ip_routes_ipv4 + ip_routes_ipv6, exabgp_port, exabgp_port_v6)
 
         with allure.step("Execute bgp sessions restart"):
             restart_bgp_session(duthost)
@@ -535,10 +798,11 @@ def test_bgp_route_with_suppress_negative_operation(duthost, tbinfo, nbrhosts, p
             )
 
         with allure.step("Validate announced BGP ipv4 and ipv6 routes are in {} state".format(QUEUED)):
-            validate_route_states(duthost)
+            validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6)
 
         with allure.step("Validate BGP ipv4 and ipv6 routes are not announced to T2 VM peer"):
-            validate_route_propagate(duthost, tbinfo, exist=False)
+            validate_route_propagate(duthost, tbinfo, exist=False, ipv4_route_list=ip_routes_ipv4,
+                                     ipv6_route_list=ip_routes_ipv6)
 
         with allure.step("Config static route and redistribute to BGP"):
             port = get_eth_port(duthost, tbinfo)
@@ -554,29 +818,32 @@ def test_bgp_route_with_suppress_negative_operation(duthost, tbinfo, nbrhosts, p
 
         with allure.step("Validate traffic could not be forwarded to T0 VM"):
             ptf_interfaces = get_t2_ptf_intfs(mg_facts)
-            validate_traffic(ptfadapter, TRAFFIC_DATA_DROP, router_mac, ptf_interfaces, recv_port)
+            validate_traffic(ptfadapter, traffic_data_ipv4_drop + traffic_data_ipv6_drop,
+                             router_mac, ptf_interfaces, recv_port)
 
         with allure.step("Restore orchagent process"):
             operate_orchagent(duthost, action=ACTION_CONTINUE)
 
         with allure.step("Validate announced BGP ipv4 and ipv6 routes are not in {} state".format(QUEUED)):
-            validate_route_states(duthost, check_point=QUEUED, action=ACTION_NOT_IN)
+            validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, check_point=QUEUED, action=ACTION_NOT_IN)
 
         with allure.step("Validate announced BGP ipv4 and ipv6 routes are in {} state".format(OFFLOADED)):
-            validate_route_states(duthost, check_point=OFFLOADED)
+            validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, check_point=OFFLOADED)
 
         with allure.step("Validate BGP ipv4 and ipv6 routes are announced to T2 VM peer"):
-            validate_route_propagate(duthost, tbinfo)
+            validate_route_propagate(duthost, tbinfo, ipv4_route_list=ip_routes_ipv4, ipv6_route_list=ip_routes_ipv6)
 
         with allure.step("Validate traffic would be forwarded to T0 VM"):
-            validate_traffic(ptfadapter, TRAFFIC_DATA_FORWARD, router_mac, ptf_interfaces, recv_port)
+            validate_traffic(ptfadapter, traffic_data_ipv4_forward + traffic_data_ipv6_forward,
+                             router_mac, ptf_interfaces, recv_port)
 
     finally:
         with allure.step("Delete static route and remove redistribute to BGP"):
             remove_static_route_and_redistribute(duthost)
 
 
-def test_credit_loop(duthost, tbinfo, nbrhosts, ptfadapter, get_exabgp_ptf_ports, restore_bgp_suppress_fib):
+def test_credit_loop(duthost, tbinfo, nbrhosts, ptfadapter, get_exabgp_ptf_ports, restore_bgp_suppress_fib,
+                     generate_route_and_traffic_data, test_type=DEFAULT_TEST_TYPE):
     """
     The problem with BGP programming occurs after the T1 switch is rebooted:
 
@@ -587,6 +854,11 @@ def test_credit_loop(duthost, tbinfo, nbrhosts, ptfadapter, get_exabgp_ptf_ports
     T1 sends it back to a default route - same T2
     When the traffic is bounced back on lossless queue, buffers on both sides are overflown, credit loop happens
     """
+    # Get route and traffic data for testing
+    (ip_routes_ipv4, ip_routes_ipv6,
+     traffic_data_ipv4_forward, traffic_data_ipv6_forward,
+     traffic_data_ipv4_drop, traffic_data_ipv6_drop) = get_test_data(generate_route_and_traffic_data, test_type)
+
     with allure.step("Prepare needed parameters"):
         router_mac = duthost.facts["router_mac"]
         mg_facts = duthost.get_extended_minigraph_facts(tbinfo)
@@ -601,14 +873,15 @@ def test_credit_loop(duthost, tbinfo, nbrhosts, ptfadapter, get_exabgp_ptf_ports
         operate_orchagent(duthost)
 
     with allure.step("Announce BGP ipv4 and ipv6 routes to DUT from T0 VM by ExaBGP"):
-        announce_ipv4_ipv6_routes(ptf_ip, exabgp_port, exabgp_port_v6)
+        install_route_from_exabgp(ANNOUNCE, ptf_ip, ip_routes_ipv4 + ip_routes_ipv6, exabgp_port, exabgp_port_v6)
 
     with allure.step("Validate the BGP routes are propagated to T2 VM"):
-        validate_route_propagate(duthost, tbinfo)
+        validate_route_propagate(duthost, tbinfo, ipv4_route_list=ip_routes_ipv4, ipv6_route_list=ip_routes_ipv6)
 
     with allure.step("Validate traffic is forwarded back to T2 VM"):
         ptf_interfaces = get_t2_ptf_intfs(mg_facts)
-        validate_traffic(ptfadapter, TRAFFIC_DATA_FORWARD, router_mac, ptf_interfaces, ptf_interfaces, loop_back=True)
+        validate_traffic(ptfadapter, traffic_data_ipv4_forward + traffic_data_ipv6_forward,
+                         router_mac, ptf_interfaces, ptf_interfaces, loop_back=True)
 
     with allure.step("Config bgp suppress-fib-pending function"):
         config_bgp_suppress_fib(duthost)
@@ -617,8 +890,9 @@ def test_credit_loop(duthost, tbinfo, nbrhosts, ptfadapter, get_exabgp_ptf_ports
         operate_orchagent(duthost, action=ACTION_CONTINUE)
 
     with allure.step("Validate announced BGP ipv4 and ipv6 routes are in {} state".format(OFFLOADED)):
-        validate_route_states(duthost, check_point=OFFLOADED)
+        validate_route_states(duthost, ip_routes_ipv4 + ip_routes_ipv6, check_point=OFFLOADED)
 
     with allure.step("Validate traffic would be forwarded to T0 VM"):
         ptf_interfaces = get_t2_ptf_intfs(mg_facts)
-        validate_traffic(ptfadapter, TRAFFIC_DATA_FORWARD, router_mac, ptf_interfaces, recv_port)
+        validate_traffic(ptfadapter, traffic_data_ipv4_forward + traffic_data_ipv6_forward,
+                         router_mac, ptf_interfaces, recv_port)
